@@ -20,6 +20,7 @@ import optax
 import flax
 
 from bbf import spr_networks
+from bbf import target_update
 from bbf.replay_memory import subsequence_replay_buffer, circular_replay_buffer
 
 NATURE_DQN_OBSERVATION_SHAPE = (84, 84)  # Size of downscaled Atari 2600 frame.
@@ -846,10 +847,8 @@ def train(
         online_params = new_online_params
 
         target_update_step = functools.partial(
-            interpolate_weights,
-            keys=None,
-            old_weight=1 - target_update_tau,
-            new_weight=target_update_tau,
+            target_update.polyak_update,
+            tau=target_update_tau,
         )
         target_params = jax.lax.cond(
             step % target_update_every == 0,
@@ -1091,6 +1090,8 @@ class BBFAgent(JaxDQNAgent):
         shrink_factor=0.8,  # original was 0.4
         target_update_tau=1.0,
         max_target_update_tau=None,
+        target_update_tau_schedule="constant",
+        target_update_tau_schedule_steps=None,
         cycle_steps=0,
         target_update_period=1,
         target_action_selection=False,
@@ -1190,7 +1191,9 @@ class BBFAgent(JaxDQNAgent):
         self.grad_steps = 0
         self.cycle_grad_steps = 0
         self.target_update_period = int(target_update_period)
-        self.target_update_tau = target_update_tau
+        if self.target_update_period <= 0:
+            raise ValueError("target_update_period must be positive")
+        self.target_update_tau = float(target_update_tau)
 
         if max_update_horizon is None:
             self.max_update_horizon = self.update_horizon
@@ -1203,8 +1206,29 @@ class BBFAgent(JaxDQNAgent):
             self.update_horizon_scheduler = lambda x: int(  # pylint: disable=g-long-lambda
                 np.round(n_schedule(x) * self.max_update_horizon))
 
-        self.max_target_update_tau = target_update_tau
-        self.target_update_tau_scheduler = lambda x: self.target_update_tau
+        self.max_target_update_tau = (
+            self.target_update_tau if max_target_update_tau is None else
+            float(max_target_update_tau))
+        self.target_update_tau_schedule = str(
+            target_update_tau_schedule).lower()
+        if target_update_tau_schedule_steps is None:
+            target_update_tau_schedule_steps = cycle_steps
+        self.target_update_tau_schedule_steps = int(
+            target_update_tau_schedule_steps)
+        self.target_update_tau_scheduler = target_update.create_tau_scheduler(
+            initial_tau=self.target_update_tau,
+            final_tau=self.max_target_update_tau,
+            schedule=self.target_update_tau_schedule,
+            schedule_steps=self.target_update_tau_schedule_steps,
+        )
+        logging.info(
+            "\t Target update tau schedule: %s, initial=%f, final=%f, "
+            "steps=%d",
+            self.target_update_tau_schedule,
+            self.target_update_tau,
+            self.max_target_update_tau,
+            self.target_update_tau_schedule_steps,
+        )
 
         logging.info("\t Found following local devices: %s",
                      str(jax.local_devices()))
