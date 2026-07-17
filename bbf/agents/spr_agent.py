@@ -419,6 +419,7 @@ train_static_argnames = [
     'use_target_backups',
     'match_online_target_rngs',
     'target_eval_mode',
+    'critic_backup_mode',
     'reward_weight',
     'continue_weight',
     'imag_horizon',
@@ -453,6 +454,7 @@ def train(
     step,
     match_online_target_rngs,  # static
     target_eval_mode,  # static
+    critic_backup_mode,  # static
     #ent_targ,
     x_ent_coef,
     per_step_rewards,
@@ -799,7 +801,8 @@ def train(
 
         # Use the weighted mean loss for gradient computation.
         target = jax.vmap(target_output,
-                          in_axes=(None, None, 0, 0, 0, None, 0, 0),
+                          in_axes=(None, None, 0, 0, 0, None, 0, 0, None,
+                                   None),
                           axis_name="batch")(
                               policy_online,
                               q_target,
@@ -809,6 +812,8 @@ def train(
                               support,
                               cumulative_gamma,
                               target_rng,
+                              critic_backup_mode,
+                              x_ent_coef,
                           )
 
         future_states = states[:, 1:]
@@ -934,17 +939,32 @@ def target_output(
     support,
     cumulative_gamma,
     rng,
+    critic_backup_mode,
+    entropy_coefficient,
 ):
     gamma_with_terminal = (cumulative_gamma *
                            (1.0 - terminals.astype(jnp.float32)))
     target_dist = target_network(next_states)
-    _, next_qt_argmax = policy_info(next_states, rng)
-
-    # Compute the target Q-value distribution
+    policy_logits, next_action = policy_info(next_states, rng)
     probabilities = jnp.squeeze(target_dist.probabilities)
-    next_probabilities = probabilities[next_qt_argmax]
-    target_support = rewards + gamma_with_terminal * support
-    target = project_distribution(target_support, next_probabilities, support)
+    if critic_backup_mode == 'sampled':
+        next_probabilities = probabilities[next_action]
+        target_support = rewards + gamma_with_terminal * support
+        target = project_distribution(target_support, next_probabilities,
+                                      support)
+    else:
+        policy_log_probs = jax.nn.log_softmax(policy_logits)
+        policy_probs = jnp.exp(policy_log_probs)
+        # Exact discrete soft backup: project each action distribution after
+        # adding its entropy reward, then mix using the online policy.
+        target_supports = rewards + gamma_with_terminal * (
+            support[None, :] -
+            entropy_coefficient * policy_log_probs[:, None])
+        action_targets = jax.vmap(project_distribution,
+                                  in_axes=(0, 0, None))(target_supports,
+                                                        probabilities,
+                                                        support)
+        target = jnp.sum(policy_probs[:, None] * action_targets, axis=0)
 
     return jax.lax.stop_gradient(target)
 
@@ -1097,6 +1117,7 @@ class BBFAgent(JaxDQNAgent):
         use_target_network=True,
         match_online_target_rngs=True,
         target_eval_mode=False,
+        critic_backup_mode='sampled',
         offline_update_frac=0,
         reward_weight=1.0,
         continue_weight=1.0,
@@ -1161,6 +1182,9 @@ class BBFAgent(JaxDQNAgent):
         self.use_target_network = use_target_network
         self.match_online_target_rngs = match_online_target_rngs
         self.target_eval_mode = target_eval_mode
+        if critic_backup_mode not in ('sampled', 'exact_soft'):
+            raise ValueError('critic_backup_mode must be sampled or exact_soft')
+        self.critic_backup_mode = critic_backup_mode
 
         self.reward_weight = float(reward_weight)
         self.continue_weight = float(continue_weight)
@@ -1571,6 +1595,7 @@ class BBFAgent(JaxDQNAgent):
             self.grad_steps,
             self.match_online_target_rngs,
             self.target_eval_mode,
+            self.critic_backup_mode,
             #self.ent_targ,
             self.x_ent_coef,
             self.replay_elements["reward"],
