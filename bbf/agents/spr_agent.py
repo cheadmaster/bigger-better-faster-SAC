@@ -82,6 +82,32 @@ def sigmoid_binary_cross_entropy(logits, labels):
         jnp.exp(-jnp.abs(logits)))
 
 
+def categorical_actor_loss(q_values, logits, rng, entropy_coefficient,
+                           mode="sampled"):
+    """Computes a discrete maximum-entropy actor loss for one state.
+
+    ``exact`` enumerates the (small) discrete action set, while ``sampled``
+    preserves the original single-sample policy-gradient estimator. Q-values
+    are always treated as critic targets, so this loss only differentiates the
+    policy path even when actor and critic share an encoder.
+    """
+    log_prob = jax.nn.log_softmax(logits)
+    prob = jnp.exp(log_prob)
+    stopped_q = jax.lax.stop_gradient(q_values)
+    entropy = -jnp.sum(prob * log_prob)
+    if mode == "exact":
+        loss = jnp.sum(prob *
+                       (entropy_coefficient * log_prob - stopped_q))
+    elif mode == "sampled":
+        action = jax.random.categorical(rng, logits)
+        advantage = jax.lax.stop_gradient(
+            stopped_q[action] - jnp.sum(prob * stopped_q))
+        loss = -advantage * log_prob[action] - entropy_coefficient * entropy
+    else:
+        raise ValueError("actor_loss_mode must be 'sampled' or 'exact'")
+    return loss, entropy
+
+
 def masked_mean(values, mask, eps=1e-6):
     mask = mask.astype(jnp.float32)
     return jnp.sum(values * mask) / (jnp.sum(mask) + eps)
@@ -419,6 +445,7 @@ train_static_argnames = [
     'use_target_backups',
     'match_online_target_rngs',
     'target_eval_mode',
+    'actor_loss_mode',
     'reward_weight',
     'continue_weight',
     'imag_horizon',
@@ -453,6 +480,7 @@ def train(
     step,
     match_online_target_rngs,  # static
     target_eval_mode,  # static
+    actor_loss_mode,  # static
     #ent_targ,
     x_ent_coef,
     per_step_rewards,
@@ -578,23 +606,8 @@ def train(
                                          method=network_def.init_fn)
 
             def policy_loss(q_values, logits, x_key):
-                samples = jax.random.categorical(x_key, logits)
-
-                log_prob = jax.nn.log_softmax(logits)
-                prob = jax.nn.softmax(logits)
-                q_values = q_values[samples] - (q_values * prob).sum()
-                ent_coef = network_def.apply(params,
-                                             method=network_def.entropy_scale)
-                x_ent = -(prob * log_prob).sum()
-                #if True:
-                if False:
-                    return -(jax.lax.stop_gradient(q_values) * log_prob[samples]
-                            ) + ent_coef * (-x_ent + ent_targ), x_ent
-                else:
-                    return -(jax.lax.stop_gradient(q_values) *
-                             log_prob[samples]) + x_ent_coef * (-x_ent), x_ent
-                    #return -(jax.lax.stop_gradient(q_values) *
-                    #         log_prob[samples]), x_ent
+                return categorical_actor_loss(q_values, logits, x_key,
+                                              x_ent_coef, actor_loss_mode)
 
             x, logits = jax.vmap(all_results,
                                  in_axes=(0, 0, None),
@@ -1097,6 +1110,7 @@ class BBFAgent(JaxDQNAgent):
         use_target_network=True,
         match_online_target_rngs=True,
         target_eval_mode=False,
+        actor_loss_mode='sampled',
         offline_update_frac=0,
         reward_weight=1.0,
         continue_weight=1.0,
@@ -1161,6 +1175,9 @@ class BBFAgent(JaxDQNAgent):
         self.use_target_network = use_target_network
         self.match_online_target_rngs = match_online_target_rngs
         self.target_eval_mode = target_eval_mode
+        if actor_loss_mode not in ('sampled', 'exact'):
+            raise ValueError("actor_loss_mode must be 'sampled' or 'exact'")
+        self.actor_loss_mode = actor_loss_mode
 
         self.reward_weight = float(reward_weight)
         self.continue_weight = float(continue_weight)
@@ -1571,6 +1588,7 @@ class BBFAgent(JaxDQNAgent):
             self.grad_steps,
             self.match_online_target_rngs,
             self.target_eval_mode,
+            self.actor_loss_mode,
             #self.ent_targ,
             self.x_ent_coef,
             self.replay_elements["reward"],
